@@ -15,7 +15,7 @@ class ReuploadingU3(ReuploadingCircuit):
         nlayers: int,
         data_dimensionality: Tuple,
         actf1: Callable = lambda x: x,
-        actf2: Callable = lambda x: log(x),
+        actf2: Callable = lambda x: log(np.abs(x) + 1e-5),
         actf3: Callable = lambda x: exp(x),
     ):
         """Reuplading U3 ansatz."""
@@ -47,6 +47,7 @@ class ReuploadingU3(ReuploadingCircuit):
     def inject_data(self, x):
         new_parameters = []
         k = 0
+
         for _ in range(self.nlayers):
             for q in range(self.nqubits):
                 new_parameters.append(
