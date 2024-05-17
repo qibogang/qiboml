@@ -3,10 +3,12 @@
 from typing import List, Optional, Union
 
 import qibo
+import qibo.backends
 from qibo.backends import construct_backend
 from qibo.config import raise_error
+from qibojit.backends import NumbaBackend
 
-from qiboml.backends import TensorflowBackend
+from qiboml.backends import JaxBackend, TensorflowBackend
 
 
 def expectation(
@@ -14,7 +16,7 @@ def expectation(
     circuit: qibo.Circuit,
     initial_state: Optional[Union[List, qibo.Circuit]] = None,
     nshots: int = None,
-    backend: str = "qibojit",
+    exec_backend: qibo.backends.Backend = NumbaBackend,
     differentiation_rule: Optional[callable] = None,
 ):
     """
@@ -38,9 +40,9 @@ def expectation(
         nshots (int): number of times the quantum circuit is executed. Increasing
             the number of shots will reduce the variance of the estimated expectation
             value while increasing the computational cost of the operation.
-        backend (str): backend on which the circuit is executed. This same backend
-            is used if the chosen differentiation rule makes use of expectation
-            values.
+        exec_backend (qibo.backend.Backend): backend on which the circuit
+            is executed. This same backend is used if the chosen differentiation
+            rule makes use of expectation values.
         differentiation_rule (Optional[callable]): the chosen differentiation
             rule. It can be selected among the methods implemented in
             ``qiboml.differentiation``.
@@ -48,30 +50,27 @@ def expectation(
 
     # read the frontend user choice
     frontend = observable.backend
-    exec_backend = construct_backend(backend)
 
     kwargs = dict(
         observable=observable,
         circuit=circuit,
         initial_state=initial_state,
         nshots=nshots,
-        differentiation_rule=differentiation_rule,
         exec_backend=exec_backend,
+        differentiation_rule=differentiation_rule,
     )
 
     if differentiation_rule is not None:
         if isinstance(frontend, TensorflowBackend):
             return _with_tf(**kwargs)
 
+        if isinstance(frontend, JaxBackend):
+            return _with_jax(**kwargs)
+
     elif nshots is None:
         return _exact(observable, circuit, initial_state, exec_backend)
     else:
         return _with_shots(observable, circuit, initial_state, nshots, exec_backend)
-
-    raise_error(
-        NotImplementedError,
-        "Only tensorflow automatic differentiation is supported at this moment.",
-    )
 
 
 def _exact(observable, circuit, initial_state, exec_backend):
@@ -137,3 +136,51 @@ def _with_tf(
         return expval, grad
 
     return _expectation(params)
+
+
+def _with_jax(
+    observable,
+    circuit,
+    initial_state,
+    nshots,
+    exec_backend,
+    differentiation_rule,
+):
+    """
+    Compute expectation sample integrating the custom differentiation rule with
+    TensorFlow's automatic differentiation.
+    """
+    import jax  # pylint: disable=import-error
+
+    params = circuit.get_parameters()
+
+    @jax.custom_gradient
+    def _expectation(params):
+        params = jax.numpy.array(params)
+
+        def grad(params):
+            gradients = []
+            for p in range(len(params)):
+                gradients.append(
+                    differentiation_rule(
+                        circuit=circuit,
+                        hamiltonian=observable,
+                        parameter_index=p,
+                        initial_state=initial_state,
+                        nshots=nshots,
+                        exec_backend=exec_backend,
+                    )
+                )
+                print("ciao")
+            return jax.numpy.array(gradients)
+
+        if nshots is None:
+            expval = jax.jit(_exact(observable, circuit, initial_state, exec_backend))
+        else:
+            expval = jax.jit(
+                _with_shots(observable, circuit, initial_state, nshots, exec_backend)
+            )
+
+        return expval, lambda g: g * jax.jit(grad(params))
+
+    return jax.jit(_expectation(params))
