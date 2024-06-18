@@ -1,98 +1,29 @@
+from typing import Optional, Union
+
+import jax
 import numpy as np
-from qibo.backends import construct_backend
+import qibo
+import qibo.backends
 from qibo.config import raise_error
 from qibo.hamiltonians.abstract import AbstractHamiltonian
 
+from qiboml.operations import expectation
 
-def parameter_shift(
-    hamiltonian,
-    circuit,
-    parameter_index,
-    exec_backend,
-    initial_state=None,
-    scale_factor=1,
-    nshots=None,
+
+def _one_parameter_shift(
+    hamiltonian: qibo.hamiltonians.Hamiltonian,
+    circuit: qibo.Circuit,
+    parameter_index: int,
+    initial_state: Optional[Union[np.ndarray, qibo.Circuit]],
+    nshots: int,
+    exec_backend: qibo.backends.Backend,
 ):
-    """In this method the parameter shift rule (PSR) is implemented.
-    Given a circuit U and an observable H, the PSR allows to calculate the derivative
-    of the expected value of H on the final state with respect to a variational
-    parameter of the circuit.
-    There is also the possibility of setting a scale factor. It is useful when a
-    circuit's parameter is obtained by combination of a variational
-    parameter and an external object, such as a training variable in a Quantum
-    Machine Learning problem. For example, performing a re-uploading strategy
-    to embed some data into a circuit, we apply to the quantum state rotations
-    whose angles are in the form: theta' = theta * x, where theta is a variational
-    parameter and x an input variable. The PSR allows to calculate the derivative
-    with respect of theta' but, if we want to optimize a system with respect its
-    variational parameters we need to "free" this procedure from the x depencency.
-    If the `scale_factor` is not provided, it is set equal to one and doesn't
-    affect the calculation.
-    If the PSR is needed to be executed on a real quantum device, it is important
-    to set `nshots` to some integer value. This enables the execution on the
-    hardware by calling the proper methods.
-
-    Args:
-        circuit (:class:`qibo.models.circuit.Circuit`): custom quantum circuit.
-        hamiltonian (:class:`qibo.hamiltonians.Hamiltonian`): target observable.
-            if you want to execute on hardware, a symbolic hamiltonian must be
-            provided as follows (example with Pauli Z and ``nqubits=1``):
-            ``SymbolicHamiltonian(np.prod([ Z(i) for i in range(1) ]))``.
-        parameter_index (int): the index which identifies the target parameter
-            in the ``circuit.get_parameters()`` list.
-        initial_state (ndarray, optional): initial state on which the circuit
-            acts. Default is ``None``.
-        scale_factor (float, optional): parameter scale factor. Default is ``1``.
-        nshots (int, optional): number of shots if derivative is evaluated on
-            hardware. If ``None``, the simulation mode is executed.
-            Default is ``None``.
-        execution_backend (str): Qibo backend on which the circuits are executed.
-
-    Returns:
-        (float): Value of the derivative of the expectation value of the hamiltonian
-            with respect to the target variational parameter.
-
-    Example:
-
-        .. testcode::
-
-            import qibo
-            import numpy as np
-            from qibo import Circuit, gates, hamiltonians
-            from qibo.derivative import parameter_shift
-
-            # defining an observable
-            def hamiltonian(nqubits = 1):
-                m0 = (1/nqubits)*hamiltonians.Z(nqubits).matrix
-                ham = hamiltonians.Hamiltonian(nqubits, m0)
-
-                return ham
-
-            # defining a dummy circuit
-            def circuit(nqubits = 1):
-                c = Circuit(nqubits = 1)
-                c.add(gates.RY(q = 0, theta = 0))
-                c.add(gates.RX(q = 0, theta = 0))
-                c.add(gates.M(0))
-
-                return c
-
-            # initializing the circuit
-            c = circuit(nqubits = 1)
-
-            # some parameters
-            test_params = np.random.randn(2)
-            c.set_parameters(test_params)
-
-            test_hamiltonian = hamiltonian()
-
-            # running the psr with respect to the two parameters
-            grad_0 = parameter_shift(circuit=c, hamiltonian=test_hamiltonian, parameter_index=0)
-            grad_1 = parameter_shift(circuit=c, hamiltonian=test_hamiltonian, parameter_index=1)
-
+    """
+    Helper method to compute the derivative of the expectation value of
+    ``hamiltonian`` over the state we get executing ``circuit`` starting from
+    ``initial_state`` w.r.t. to a target ``parameter_index``.
     """
 
-    # some raise_error
     if parameter_index > len(circuit.get_parameters()):
         raise_error(ValueError, """This index is out of bounds.""")
 
@@ -102,42 +33,26 @@ def parameter_shift(
             "hamiltonian must be a qibo.hamiltonians.Hamiltonian or qibo.hamiltonians.SymbolicHamiltonian object",
         )
 
-    # getting the gate's type
     gate = circuit.associate_gates_with_parameters()[parameter_index]
-
-    # getting the generator_eigenvalue
     generator_eigenval = gate.generator_eigenvalue()
 
-    # defining the shift according to the psr
     s = np.pi / (4 * generator_eigenval)
 
-    # saving original parameters and making a copy
     original = np.asarray(circuit.get_parameters()).copy()
     shifted = original.copy()
 
-    # forward shift
     shifted[parameter_index] += s
     circuit.set_parameters(shifted)
 
     if nshots is None:
-        # forward evaluation
-        forward = hamiltonian.expectation(
-            exec_backend.execute_circuit(
-                circuit=circuit, initial_state=initial_state
-            ).state()
-        )
 
-        # backward shift and evaluation
+        forward = expectation._exact(hamiltonian, circuit, initial_state, exec_backend)
+
         shifted[parameter_index] -= 2 * s
         circuit.set_parameters(shifted)
 
-        backward = hamiltonian.expectation(
-            exec_backend.execute_circuit(
-                circuit=circuit, initial_state=initial_state
-            ).state()
-        )
+        backward = expectation._exact(hamiltonian, circuit, initial_state, exec_backend)
 
-    # same but using expectation from samples
     else:
         forward = exec_backend.execute_circuit(
             circuit=circuit, initial_state=initial_state, nshots=nshots
@@ -152,7 +67,107 @@ def parameter_shift(
 
     circuit.set_parameters(original)
 
-    # float() necessary to not return a 0-dim ndarray
-    result = float(generator_eigenval * (forward - backward) * scale_factor)
+    return float(generator_eigenval * (forward - backward))
 
-    return result
+
+def parameter_shift(
+    hamiltonian: qibo.hamiltonians.Hamiltonian,
+    circuit: qibo.Circuit,
+    exec_backend: qibo.backends.Backend,
+    initial_state: Optional[Union[np.ndarray, qibo.Circuit]] = None,
+    nshots: int = None,
+):
+    """
+    Compute the gradient of the expectation value of ``hamiltonian`` over the
+    state we get executing ``circuit`` over ``initial_state`` with a certain
+    ``nshots`` w.r.t. the parameters of the circuit via parameter-shift
+    rule (https://arxiv.org/abs/1811.11184).
+    The number of shots can be set to be ``None`` in case of exact simulation,
+    otherwise an integer number of shots has to be provided.
+
+    Args:
+        circuit (:class:`qibo.models.circuit.Circuit`): custom quantum circuit.
+        hamiltonian (:class:`qibo.hamiltonians.Hamiltonian`): target observable.
+            if you want to execute on hardware, a symbolic hamiltonian must be
+            provided as follows (example with Pauli Z and ``nqubits=1``):
+            ``SymbolicHamiltonian(np.prod([ Z(i) for i in range(1) ]))``.
+        execution_backend (qibo.backends.Backend): Qibo backend on which the
+            circuits are executed.
+        initial_state (ndarray, optional): initial state on which the circuit
+            acts. Default is ``None``.
+        nshots (int, optional): number of shots if derivative is evaluated on
+            hardware. If ``None``, the simulation mode is executed.
+            Default is ``None``.
+
+    Returns:
+        (float): Gradient of the expectation value of the hamiltonian
+            with respect to circuit's variational parameters.
+
+    """
+    return [
+        _one_parameter_shift(
+            hamiltonian=hamiltonian,
+            circuit=circuit,
+            parameter_index=i,
+            initial_state=initial_state,
+            nshots=nshots,
+            exec_backend=exec_backend,
+        )
+        for i in range(len(circuit.get_parameters()))
+    ]
+
+
+def symbolical(
+    hamiltonian: qibo.hamiltonians.Hamiltonian,
+    circuit: qibo.Circuit,
+    exec_backend: qibo.backends.Backend,
+    initial_state: Optional[Union[np.ndarray, qibo.Circuit]] = None,
+):
+    """
+    Compute the gradient of the expectation value of ``hamiltonian`` over the
+    state we get executing ``circuit`` over ``initial_state`` with a certain
+    ``nshots`` w.r.t. the parameters of the circuit using TensorFlow automatic
+    differentiation.
+
+    Args:
+        circuit (:class:`qibo.models.circuit.Circuit`): custom quantum circuit.
+        hamiltonian (:class:`qibo.hamiltonians.Hamiltonian`): target observable.
+            if you want to execute on hardware, a symbolic hamiltonian must be
+            provided as follows (example with Pauli Z and ``nqubits=1``):
+            ``SymbolicHamiltonian(np.prod([ Z(i) for i in range(1) ]))``.
+        execution_backend (qibo.backends.Backend): Qibo backend on which the
+            circuits are executed.
+        initial_state (ndarray, optional): initial state on which the circuit
+            acts. Default is ``None``.
+
+    Returns:
+        (float): Gradient of the expectation value of the hamiltonian
+            with respect to circuit's variational parameters.
+
+    """
+    import tensorflow as tf  # pylint: disable=import-error
+
+    # TODO: how to fix this at lower level?
+    circuit_parameters = tf.Variable(circuit.get_parameters(), dtype="float64")
+
+    with tf.GradientTape() as tape:
+        circuit.set_parameters(circuit_parameters)
+        expval = expectation._exact(hamiltonian, circuit, initial_state, exec_backend)
+
+    gradients = tape.gradient(expval, circuit_parameters)
+
+    return tf.squeeze(gradients)
+
+
+def symbolical_with_jax(
+    hamiltonian: qibo.hamiltonians.Hamiltonian,
+    circuit: qibo.Circuit,
+    exec_backend,
+    initial_state: Optional[Union[np.ndarray, qibo.Circuit]] = None,
+):
+    def _expectation(params):
+        params = jax.numpy.array(params)
+        circuit.set_parameters(params)
+        return expectation._exact(hamiltonian, circuit, initial_state, exec_backend)
+
+    return jax.grad(_expectation)(circuit.get_parameters())
